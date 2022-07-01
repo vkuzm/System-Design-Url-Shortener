@@ -1,17 +1,21 @@
 import { Body, Controller, Get, HttpCode, HttpStatus, Param, Post, Req, Res } from '@nestjs/common';
 import { Request, Response } from 'express';
 import UrlResponseDto from 'src/dto/urlResponse.dto';
+import { AuthTokenService } from 'src/service/authToken.service';
+import { UrlAutoCleanUp } from 'src/service/urlAutoCleanUp.service';
 import UrlRequestDto from '../dto/urlRequest.dto';
 import { UrlRepository } from '../repository/url.repository';
 import { UserRepository } from '../repository/user.repository';
 import { KeyGeneratorService } from '../service/keyGenerator.service';
 
-@Controller('/')
+@Controller()
 export class UrlController {
   constructor(
     private readonly userRepository: UserRepository,
     private readonly urlRepository: UrlRepository,
-    private readonly keyGeneratorService: KeyGeneratorService
+    private readonly keyGeneratorService: KeyGeneratorService,
+    private readonly authTokenService: AuthTokenService,
+    private readonly urlAutoCleanUp: UrlAutoCleanUp
   ) { }
 
   @Get('/:urlHash')
@@ -20,25 +24,47 @@ export class UrlController {
       const url = this.urlRepository.findByUrlHash(params.urlHash);
 
       if (url) {
-        return res.redirect(url.originalUrl, HttpStatus.MOVED_PERMANENTLY);
+        const currentDate = new Date().getTime();
+        const expirationDate = parseInt(url.expirationDate);
+
+        if (currentDate > expirationDate) {
+          console.log(`Hash URL ${params.urlHash} is already expired`);
+
+          this.urlRepository.delete(params.urlHash);
+          return res.status(HttpStatus.NOT_FOUND).send();
+        }
+
+        return res.redirect(HttpStatus.MOVED_PERMANENTLY, url.originalUrl);
       }
     }
 
     return res.status(HttpStatus.NOT_FOUND).send();
   }
 
-  @Get('/url')
+  @Get('/url/list')
   @HttpCode(HttpStatus.OK)
-  findAllShortUrls() {
-    // TODO Find all for a specific user id
-    return this.urlRepository.findAll();
+  async findAllShortUrls(@Req() req: Request, @Res() res: Response) {
+    if (!req.headers.authorization) {
+      return res.status(HttpStatus.UNAUTHORIZED).send();
+    }
+
+    const { userId } = await this.authTokenService.decodeToken(req.headers.authorization);
+
+    const urls = this.urlRepository.findAllByUserId(parseInt(userId));
+    return res.status(HttpStatus.OK).send(urls);
   }
 
   @Post('/url/create')
-  createUrl(@Body() urlRequestDto: UrlRequestDto, @Req() req: Request, @Res() res: Response<UrlResponseDto>) {
-    if (true || this.userRepository.findUserById(urlRequestDto.userId)) { // TODO check header + user access
+  async createUrl(@Body() urlRequestDto: UrlRequestDto, @Req() req: Request, @Res() res: Response<UrlResponseDto>) {
+    if (!req.headers.authorization) {
+      return res.status(HttpStatus.UNAUTHORIZED).send();
+    }
+
+    const { userId } = await this.authTokenService.decodeToken(req.headers.authorization);
+    if (this.userRepository.findUserById(userId)) {
       const urlHash = this.keyGeneratorService.generate(urlRequestDto);
       const createdUrl = this.urlRepository.create(urlRequestDto, req.headers.host, urlHash);
+      this.urlAutoCleanUp.start();
 
       return res.status(HttpStatus.CREATED).send(createdUrl);
     }
